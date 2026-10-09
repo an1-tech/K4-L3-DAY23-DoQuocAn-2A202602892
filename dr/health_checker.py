@@ -29,13 +29,96 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    try:
+        response = httpx.get(
+            f"{URL[region]}/readyz",
+            timeout=timeout,
+        )
+        body = response.json()
+
+        if response.status_code == 200 and body.get("ready"):
+            return True, "ready"
+
+        reasons = body.get("reasons") or [
+            f"http_{response.status_code}"
+        ]
+        return False, "; ".join(str(reason) for reason in reasons)
+
+    except (httpx.HTTPError, ValueError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
-def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+def run(
+    interval: float,
+    timeout: float,
+    threshold: int,
+    duration: float,
+    out: pathlib.Path,
+):
+    if interval <= 0 or timeout <= 0 or threshold < 1 or duration <= 0:
+        raise ValueError(
+            "Thời gian phải dương và threshold phải >= 1"
+        )
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    states = {region: "HEALTHY" for region in URL}
+    failures = {region: 0 for region in URL}
+    deadline = time.monotonic() + duration
+
+    with out.open("a", encoding="utf-8") as stream:
+        while time.monotonic() < deadline:
+            round_started = time.monotonic()
+
+            for region in URL:
+                ready, reason = probe(region, timeout)
+
+                if ready:
+                    failures[region] = 0
+                    new_state = "HEALTHY"
+                else:
+                    failures[region] += 1
+                    new_state = (
+                        "UNHEALTHY"
+                        if failures[region] >= threshold
+                        else states[region]
+                    )
+
+                if new_state == states[region]:
+                    continue
+
+                old_state = states[region]
+                states[region] = new_state
+                now = time.time()
+
+                record = {
+                    "ts": now,
+                    "iso": time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ",
+                        time.gmtime(now),
+                    ),
+                    "event": "state_change",
+                    "region": region,
+                    "from": old_state,
+                    "to": new_state,
+                    "reason": reason,
+                    "interval_s": interval,
+                    "threshold": threshold,
+                    "consecutive_fails": failures[region],
+                }
+
+                text = json.dumps(record, ensure_ascii=False)
+                stream.write(text + "\n")
+                stream.flush()
+                print(text, flush=True)
+
+            remaining = deadline - time.monotonic()
+            pause = interval - (
+                time.monotonic() - round_started
+            )
+
+            if remaining > 0 and pause > 0:
+                time.sleep(min(pause, remaining))
 
 
 if __name__ == "__main__":
